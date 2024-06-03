@@ -63,7 +63,7 @@ class ToonCrafterNode:
         }
 
     RETURN_TYPES = ("IMAGE", )
-    FUNCTION = "get_image"
+    FUNCTION = "single_interpolation"
 
     OUTPUT_NODE = True
 
@@ -108,7 +108,10 @@ class ToonCrafterNode:
             print(f"Autocast is not supported: {e}")
             yield
 
-def get_image(self, image: torch.Tensor, ckpt_name, prompt, steps=50, cfg_scale=7.5, eta=1.0, frame_count=3, fps=8, seed=123, image2: torch.Tensor = None):
+    def single_interpolation(self, image: torch.Tensor, ckpt_name, prompt, steps=50, cfg_scale=7.5, eta=1.0, frame_count=3, fps=8, seed=123, image2: torch.Tensor = None):
+        return get_image(image, ckpt_name, prompt, steps, cfg_scale, eta, frame_count, fps, seed, image2)
+
+def get_image(image: torch.Tensor, ckpt_name, prompt, steps=50, cfg_scale=7.5, eta=1.0, frame_count=3, fps=8, seed=123, image2: torch.Tensor = None):
     self.init(ckpt_name=ckpt_name)
     self.save_fps = fps
     seed = seed % 4294967295
@@ -219,8 +222,7 @@ class BatchToonCrafterNode:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "image": ("IMAGE", ),
-                "image2": ("IMAGE", ),
+                "images": ("IMAGE", ),
                 "ckpt_name": (get_models(), ),
                 "prompt": ("STRING", {"multiline": True, "dynamicPrompts": True}),
                 # "clip": ("CLIP", ),
@@ -228,13 +230,13 @@ class BatchToonCrafterNode:
                 "eta": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 15.0, "step": 0.1}),
                 "cfg_scale": ("FLOAT", {"default": 7.5, "min": 1.0, "max": 15.0, "step": 0.5}),
                 "steps": ("INT", {"default": 50, "min": 1, "max": 60, "step": 1}),
-                "frame_count": ("INT", {"default": 10, "min": 5, "max": 30, "step": 1}),
+                "frame_counts": ("INT", {"default": 10, "min": 5, "max": 30, "step": 1}),
                 "fps": ("INT", {"default": 8, "min": 1, "max": 60, "step": 1}),
             }
         }
 
     RETURN_TYPES = ("IMAGE", )
-    FUNCTION = "get_image"
+    FUNCTION = "batch_interpolation"
 
     OUTPUT_NODE = True
 
@@ -279,13 +281,29 @@ class BatchToonCrafterNode:
             print(f"Autocast is not supported: {e}")
             yield
 
+    def batch_interpolation(self, images: torch.Tensor, ckpt_name, prompt, steps=50, cfg_scale=7.5, eta=1.0, frame_count=3, fps=8, seed=123):
+        process_batch()
+        return
+
+    def process_batch(self, images, num_frames):
+        image_list = []
+        for i in range(0,len(images)):
+            if i != 0:
+                image_list.append(images[i - 1], images[i], num_frames[i])
+        return torch.cat(image_list)
+
+
+
+
 NODE_CLASS_MAPPINGS = {
     "ToonCrafterNode": ToonCrafterNode,
+    "BatchToonCrafterNode": BatchToonCrafterNode,
 }
 
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ToonCrafterNode": "ToonCrafter",
+    "BatchToonCrafterNode": "BatchToonCrafter",
 }
 
 WEB_DIRECTORY = "./"
