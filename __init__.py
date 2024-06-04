@@ -32,14 +32,35 @@ from ToonCrafter.scripts.evaluation.funcs import load_model_checkpoint, batch_dd
 
 
 @cache
+@cache
 def get_models(root: Path = ROOT.joinpath("checkpoints")):
     ckpts = []
     files = []
+    print(f"Looking for model files in: {root.as_posix()}")
+
+    if not root.exists():
+        print(f"Directory {root.as_posix()} does not exist!")
+        return []
+
     for ext in ['ckpt', 'pt', 'bin', 'pth', 'safetensors', 'pkl']:
-        files.extend(root.rglob(f"*.{ext}"))
+        print(f"Searching for files with extension: {ext}")
+        found_files = list(root.rglob(f"*.{ext}"))
+        if found_files:
+            files.extend(found_files)
+            print(f"Found {len(found_files)} files with extension {ext}")
+        else:
+            print(f"No files found with extension {ext}")
+
     for file in files:
-        ckpts.append(file.relative_to(root).as_posix())
+        relative_path = file.relative_to(root).as_posix()
+        print(f"Found model file: {relative_path}")
+        ckpts.append(relative_path)
+
+    if not ckpts:
+        print("No model files found!")
+
     return sorted(ckpts)
+
 
 
 class ToonCrafterNode:
@@ -109,88 +130,88 @@ class ToonCrafterNode:
             yield
 
     def single_interpolation(self, image: torch.Tensor, ckpt_name, prompt, steps=50, cfg_scale=7.5, eta=1.0, frame_count=3, fps=8, seed=123, image2: torch.Tensor = None):
-        return get_image(image, ckpt_name, prompt, steps, cfg_scale, eta, frame_count, fps, seed, image2)
+        return self.get_image(image, ckpt_name, prompt, steps, cfg_scale, eta, frame_count, fps, seed, image2)
 
-def get_image(image: torch.Tensor, ckpt_name, prompt, steps=50, cfg_scale=7.5, eta=1.0, frame_count=3, fps=8, seed=123, image2: torch.Tensor = None):
-    self.init(ckpt_name=ckpt_name)
-    self.save_fps = fps
-    seed = seed % 4294967295
-    seed_everything(seed)
-    transform = transforms.Compose([
-        transforms.Resize(min(self.resolution)),
-        transforms.CenterCrop(self.resolution),
-    ])
-    mm.soft_empty_cache()
-    print('start:', prompt, time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time())))
-    start = time.time()
-    gpu_id = 0
-    if steps > 60:
-        steps = 60
-    model: torch.nn.Module = self.model_list[gpu_id]
-    if self.is_cuda:
-        model = model.cuda()
-    elif self.is_mps:
-        model = model.to('mps')
-    batch_size = 1
-    channels = model.model.diffusion_model.out_channels
-    frames = model.temporal_length
-    h, w = self.resolution[0] // 8, self.resolution[1] // 8
-    noise_shape = [batch_size, channels, frames, h, w]
-    pbar = ProgressBar(steps)
-    # text cond
-    with ExitStack() as stack:
-        stack.enter_context(torch.no_grad())
+    def get_image(self, image: torch.Tensor, ckpt_name, prompt, steps=50, cfg_scale=7.5, eta=1.0, frame_count=3, fps=8, seed=123, image2: torch.Tensor = None):
+        self.init(ckpt_name=ckpt_name)
+        self.save_fps = fps
+        seed = seed % 4294967295
+        seed_everything(seed)
+        transform = transforms.Compose([
+            transforms.Resize(min(self.resolution)),
+            transforms.CenterCrop(self.resolution),
+        ])
+        mm.soft_empty_cache()
+        print('start:', prompt, time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time())))
+        start = time.time()
+        gpu_id = 0
+        if steps > 60:
+            steps = 60
+        model: torch.nn.Module = self.model_list[gpu_id]
         if self.is_cuda:
-            stack.enter_context(torch.cuda.amp.autocast())
-        # stack.enter_context(self.optional_autocast(device=model.device))
-        text_emb = model.get_learned_conditioning([prompt])
-        # img cond
-        img_tensor = image[0].permute(2, 0, 1).float().to(model.device)
-        img_tensor = (img_tensor - 0.5) * 2
-        image_tensor_resized = transform(img_tensor)  # 3,h,w
-        videos = image_tensor_resized.unsqueeze(0).unsqueeze(2)  # bc1hw
-        # z = get_latent_z(model, videos) #bc,1,hw
-        videos = repeat(videos, 'b c t h w -> b c (repeat t) h w', repeat=frames // 2)
-        img_tensor2 = image2[0].permute(2, 0, 1).float().to(model.device)
-        img_tensor2 = (img_tensor2 - 0.5) * 2
-        image_tensor_resized2 = transform(img_tensor2)  # 3,h,w
-        videos2 = image_tensor_resized2.unsqueeze(0).unsqueeze(2)  # bchw
-        videos2 = repeat(videos2, 'b c t h w -> b c (repeat t) h w', repeat=frames // 2)
-        videos = torch.cat([videos, videos2], dim=2)
-        z, hs = self.get_latent_z_with_hidden_states(model, videos)
-        img_tensor_repeat = torch.zeros_like(z)
-        img_tensor_repeat[:, :, :1, :, :] = z[:, :, :1, :, :]
-        img_tensor_repeat[:, :, -1:, :, :] = z[:, :, -1:, :, :]
-        cond_images = model.embedder(img_tensor.unsqueeze(0))  # blc
-        img_emb = model.image_proj_model(cond_images)
-        imtext_cond = torch.cat([text_emb, img_emb], dim=1)
-        fs = torch.tensor([frame_count], dtype=torch.long, device=model.device)
-        cond = {"c_crossattn": [imtext_cond], "fs": fs, "c_concat": [img_tensor_repeat]}
-        def cb(step):
-            print(f"step: {step}", end='\r')
-            pbar.update_absolute(step)
-        # inference
-        batch_samples = batch_ddim_sampling(model, cond, noise_shape, n_samples=1, ddim_steps=steps, ddim_eta=eta, cfg_scale=cfg_scale, hs=hs, callback=cb)
-        # remove the last frame
-        if image2 is None:
-            batch_samples = batch_samples[:, :, :, :-1, ...]
-        # b,samples,c,t,h,w
-        prompt_str = prompt.replace("/", "_slash_") if "/" in prompt else prompt
-        prompt_str = prompt_str.replace(" ", "_") if " " in prompt else prompt_str
-        prompt_str = prompt_str[:40]
-        if len(prompt_str) == 0:
-            prompt_str = 'empty_prompt'
-    # save_videos(batch_samples, self.result_dir, filenames=[prompt_str], fps=self.save_fps)
-    print(f"Saved in {prompt_str}. Time used: {(time.time() - start):.2f} seconds")
-    try:
-        # frame_count, width, height, channel
-        batch_samples = batch_samples[0][0].permute(1, 2, 3, 0)
-    except Exception as e:
-        sys.stderr.write(e)
-        return (None, )
-    batch_samples = (batch_samples + 1.0) * 0.5
-    model = model.cpu()
-    return (batch_samples, )
+            model = model.cuda()
+        elif self.is_mps:
+            model = model.to('mps')
+        batch_size = 1
+        channels = model.model.diffusion_model.out_channels
+        frames = model.temporal_length
+        h, w = self.resolution[0] // 8, self.resolution[1] // 8
+        noise_shape = [batch_size, channels, frames, h, w]
+        pbar = ProgressBar(steps)
+        # text cond
+        with ExitStack() as stack:
+            stack.enter_context(torch.no_grad())
+            if self.is_cuda:
+                stack.enter_context(torch.cuda.amp.autocast())
+            # stack.enter_context(self.optional_autocast(device=model.device))
+            text_emb = model.get_learned_conditioning([prompt])
+            # img cond
+            img_tensor = image[0].permute(2, 0, 1).float().to(model.device)
+            img_tensor = (img_tensor - 0.5) * 2
+            image_tensor_resized = transform(img_tensor)  # 3,h,w
+            videos = image_tensor_resized.unsqueeze(0).unsqueeze(2)  # bc1hw
+            # z = get_latent_z(model, videos) #bc,1,hw
+            videos = repeat(videos, 'b c t h w -> b c (repeat t) h w', repeat=frames // 2)
+            img_tensor2 = image2[0].permute(2, 0, 1).float().to(model.device)
+            img_tensor2 = (img_tensor2 - 0.5) * 2
+            image_tensor_resized2 = transform(img_tensor2)  # 3,h,w
+            videos2 = image_tensor_resized2.unsqueeze(0).unsqueeze(2)  # bchw
+            videos2 = repeat(videos2, 'b c t h w -> b c (repeat t) h w', repeat=frames // 2)
+            videos = torch.cat([videos, videos2], dim=2)
+            z, hs = get_latent_z_with_hidden_states(model, videos)
+            img_tensor_repeat = torch.zeros_like(z)
+            img_tensor_repeat[:, :, :1, :, :] = z[:, :, :1, :, :]
+            img_tensor_repeat[:, :, -1:, :, :] = z[:, :, -1:, :, :]
+            cond_images = model.embedder(img_tensor.unsqueeze(0))  # blc
+            img_emb = model.image_proj_model(cond_images)
+            imtext_cond = torch.cat([text_emb, img_emb], dim=1)
+            fs = torch.tensor([frame_count], dtype=torch.long, device=model.device)
+            cond = {"c_crossattn": [imtext_cond], "fs": fs, "c_concat": [img_tensor_repeat]}
+            def cb(step):
+                print(f"step: {step}", end='\r')
+                pbar.update_absolute(step)
+            # inference
+            batch_samples = batch_ddim_sampling(model, cond, noise_shape, n_samples=1, ddim_steps=steps, ddim_eta=eta, cfg_scale=cfg_scale, hs=hs, callback=cb)
+            # remove the last frame
+            if image2 is None:
+                batch_samples = batch_samples[:, :, :, :-1, ...]
+            # b,samples,c,t,h,w
+            prompt_str = prompt.replace("/", "_slash_") if "/" in prompt else prompt
+            prompt_str = prompt_str.replace(" ", "_") if " " in prompt else prompt_str
+            prompt_str = prompt_str[:40]
+            if len(prompt_str) == 0:
+                prompt_str = 'empty_prompt'
+        # save_videos(batch_samples, self.result_dir, filenames=[prompt_str], fps=self.save_fps)
+        print(f"Saved in {prompt_str}. Time used: {(time.time() - start):.2f} seconds")
+        try:
+            # frame_count, width, height, channel
+            batch_samples = batch_samples[0][0].permute(1, 2, 3, 0)
+        except Exception as e:
+            sys.stderr.write(e)
+            return (None, )
+        batch_samples = (batch_samples + 1.0) * 0.5
+        model = model.cpu()
+        return (batch_samples, )
 
 def download_model(self):
     REPO_ID = 'Doubiiu/ToonCrafter'
@@ -202,7 +223,7 @@ def download_model(self):
         if not local_file.exists():
             hf_hub_download(repo_id=REPO_ID, filename=filename, local_dir=model_dir.as_posix(), local_dir_use_symlinks=False)
 
-def get_latent_z_with_hidden_states(self, model, videos):
+def get_latent_z_with_hidden_states(model, videos):
     b, c, t, h, w = videos.shape
     x = rearrange(videos, 'b c t h w -> (b t) c h w')
     encoder_posterior, hidden_states = model.first_stage_model.encode(x, return_hidden_states=True)
@@ -282,17 +303,101 @@ class BatchToonCrafterNode:
             yield
 
     def batch_interpolation(self, images: torch.Tensor, ckpt_name, prompt, steps=50, cfg_scale=7.5, eta=1.0, frame_count=3, fps=8, seed=123):
-        process_batch()
-        return
+        images_a, images_b = process_batch(images,frame_count)
+        out = []
+        for i in len(images):
+            out.append(self.get_image(images_a[i],ckpt_name,prompt,steps,cfg_scale,eta,fps,seed,images_b[i]))
+        return torch.cat(out,dim=0)
 
-    def process_batch(self, images, num_frames):
-        image_list = []
+    def process_batch(self, images):
+        image_list_a = []
+        image_list_b = []
         for i in range(0,len(images)):
             if i != 0:
-                image_list.append(images[i - 1], images[i], num_frames[i])
-        return torch.cat(image_list)
+                image_list_a.append(images[i - 1])
+                image_list_b.append(images[i])
+        return torch.cat(image_list_a,dim=0), torch.cat(image_list_b,dim=0)
 
-
+    def get_image(self, image: torch.Tensor, ckpt_name, prompt, steps=50, cfg_scale=7.5, eta=1.0, frame_count=3, fps=8, seed=123, image2: torch.Tensor = None):
+        self.init(ckpt_name=ckpt_name)
+        self.save_fps = fps
+        seed = seed % 4294967295
+        seed_everything(seed)
+        transform = transforms.Compose([
+            transforms.Resize(min(self.resolution)),
+            transforms.CenterCrop(self.resolution),
+        ])
+        mm.soft_empty_cache()
+        print('start:', prompt, time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(time.time())))
+        start = time.time()
+        gpu_id = 0
+        if steps > 60:
+            steps = 60
+        model: torch.nn.Module = self.model_list[gpu_id]
+        if self.is_cuda:
+            model = model.cuda()
+        elif self.is_mps:
+            model = model.to('mps')
+        batch_size = 1
+        channels = model.model.diffusion_model.out_channels
+        frames = model.temporal_length
+        h, w = self.resolution[0] // 8, self.resolution[1] // 8
+        noise_shape = [batch_size, channels, frames, h, w]
+        pbar = ProgressBar(steps)
+        # text cond
+        with ExitStack() as stack:
+            stack.enter_context(torch.no_grad())
+            if self.is_cuda:
+                stack.enter_context(torch.cuda.amp.autocast())
+            # stack.enter_context(self.optional_autocast(device=model.device))
+            text_emb = model.get_learned_conditioning([prompt])
+            # img cond
+            img_tensor = image[0].permute(2, 0, 1).float().to(model.device)
+            img_tensor = (img_tensor - 0.5) * 2
+            image_tensor_resized = transform(img_tensor)  # 3,h,w
+            videos = image_tensor_resized.unsqueeze(0).unsqueeze(2)  # bc1hw
+            # z = get_latent_z(model, videos) #bc,1,hw
+            videos = repeat(videos, 'b c t h w -> b c (repeat t) h w', repeat=frames // 2)
+            img_tensor2 = image2[0].permute(2, 0, 1).float().to(model.device)
+            img_tensor2 = (img_tensor2 - 0.5) * 2
+            image_tensor_resized2 = transform(img_tensor2)  # 3,h,w
+            videos2 = image_tensor_resized2.unsqueeze(0).unsqueeze(2)  # bchw
+            videos2 = repeat(videos2, 'b c t h w -> b c (repeat t) h w', repeat=frames // 2)
+            videos = torch.cat([videos, videos2], dim=2)
+            z, hs = get_latent_z_with_hidden_states(model, videos)
+            img_tensor_repeat = torch.zeros_like(z)
+            img_tensor_repeat[:, :, :1, :, :] = z[:, :, :1, :, :]
+            img_tensor_repeat[:, :, -1:, :, :] = z[:, :, -1:, :, :]
+            cond_images = model.embedder(img_tensor.unsqueeze(0))  # blc
+            img_emb = model.image_proj_model(cond_images)
+            imtext_cond = torch.cat([text_emb, img_emb], dim=1)
+            fs = torch.tensor([frame_count], dtype=torch.long, device=model.device)
+            cond = {"c_crossattn": [imtext_cond], "fs": fs, "c_concat": [img_tensor_repeat]}
+            def cb(step):
+                print(f"step: {step}", end='\r')
+                pbar.update_absolute(step)
+            # inference
+            batch_samples = batch_ddim_sampling(model, cond, noise_shape, n_samples=1, ddim_steps=steps, ddim_eta=eta, cfg_scale=cfg_scale, hs=hs, callback=cb)
+            # remove the last frame
+            if image2 is None:
+                batch_samples = batch_samples[:, :, :, :-1, ...]
+            # b,samples,c,t,h,w
+            prompt_str = prompt.replace("/", "_slash_") if "/" in prompt else prompt
+            prompt_str = prompt_str.replace(" ", "_") if " " in prompt else prompt_str
+            prompt_str = prompt_str[:40]
+            if len(prompt_str) == 0:
+                prompt_str = 'empty_prompt'
+        # save_videos(batch_samples, self.result_dir, filenames=[prompt_str], fps=self.save_fps)
+        print(f"Saved in {prompt_str}. Time used: {(time.time() - start):.2f} seconds")
+        try:
+            # frame_count, width, height, channel
+            batch_samples = batch_samples[0][0].permute(1, 2, 3, 0)
+        except Exception as e:
+            sys.stderr.write(e)
+            return (None, )
+        batch_samples = (batch_samples + 1.0) * 0.5
+        model = model.cpu()
+        return (batch_samples, )
 
 
 NODE_CLASS_MAPPINGS = {
